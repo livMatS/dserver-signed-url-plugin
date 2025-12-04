@@ -1,0 +1,428 @@
+"""dserver plugin for generating signed URLs for dataset access."""
+
+try:
+    from importlib.metadata import version, PackageNotFoundError
+except ModuleNotFoundError:
+    from importlib_metadata import version, PackageNotFoundError
+
+try:
+    __version__ = version(__name__)
+except PackageNotFoundError:
+    # package is not installed
+    pass
+
+import logging
+from datetime import datetime, timedelta
+from urllib.parse import unquote
+
+import dtoolcore
+import dtoolcore.utils
+
+from flask import abort, current_app, jsonify
+from flask_smorest import Blueprint
+
+from dservercore import ExtensionABC
+from dservercore.utils import (
+    register_dataset,
+    generate_dataset_info,
+    dataset_uri_exists,
+)
+from dservercore.utils_auth import (
+    jwt_required,
+    get_jwt_identity,
+    may_search,
+    may_register,
+)
+
+from .config import Config, CONFIG_SECRETS_TO_OBFUSCATE
+from .schemas import (
+    SignedURLsResponseSchema,
+    SignedItemURLResponseSchema,
+    UploadRequestSchema,
+    UploadURLsResponseSchema,
+    UploadCompleteRequestSchema,
+    UploadCompleteResponseSchema,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+# Create the Flask-smorest blueprint
+signed_url_bp = Blueprint(
+    "signed-urls",
+    __name__,
+    url_prefix="/signed-urls",
+    description="Endpoints for generating signed URLs for dataset access"
+)
+
+
+def _extract_base_uri(uri):
+    """Extract base URI from dataset URI."""
+    return uri.rsplit("/", 1)[0]
+
+
+def _get_storage_broker(uri):
+    """Get storage broker instance for a dataset URI.
+
+    :param uri: Dataset URI
+    :returns: Storage broker instance
+    :raises: ValueError if broker doesn't support signing
+    """
+    try:
+        dataset = dtoolcore.DataSet.from_uri(uri)
+        storage_broker = dataset._storage_broker
+    except Exception as e:
+        logger.error(f"Failed to get storage broker for {uri}: {e}")
+        raise ValueError(f"Cannot access dataset at {uri}: {e}")
+
+    # Check if broker supports signing
+    if not hasattr(storage_broker, 'generate_dataset_signed_urls'):
+        raise ValueError(
+            f"Storage broker {type(storage_broker).__name__} does not support "
+            "signed URL generation"
+        )
+
+    return storage_broker
+
+
+def _get_storage_broker_for_upload(base_uri, uuid):
+    """Get storage broker instance for uploading a new dataset.
+
+    This creates a broker for a dataset that doesn't exist yet.
+
+    :param base_uri: Base URI (e.g., s3://bucket)
+    :param uuid: Dataset UUID
+    :returns: Storage broker instance
+    """
+    # Parse the base URI to get the scheme
+    parsed = dtoolcore.utils.generous_parse_uri(base_uri)
+    scheme = parsed.scheme
+
+    # Get the storage broker class for this scheme
+    storage_broker_lookup = dtoolcore._get_storage_broker_lookup()
+    if scheme not in storage_broker_lookup:
+        raise ValueError(f"Unknown storage backend: {scheme}")
+
+    StorageBrokerClass = storage_broker_lookup[scheme]
+
+    # Generate the full URI
+    uri = f"{base_uri}/{uuid}"
+
+    # Create broker instance
+    storage_broker = StorageBrokerClass(uri, config_path=Config.DTOOL_CONFIG_PATH)
+
+    # Check if broker supports signing
+    if not hasattr(storage_broker, 'generate_signed_write_url'):
+        raise ValueError(
+            f"Storage broker {StorageBrokerClass.__name__} does not support "
+            "signed URL generation for writes"
+        )
+
+    return storage_broker
+
+
+@signed_url_bp.route("/dataset/<path:uri>", methods=["GET"])
+@signed_url_bp.response(200, SignedURLsResponseSchema)
+@jwt_required()
+def get_dataset_signed_urls(uri):
+    """Get signed URLs for reading an entire dataset.
+
+    Returns a set of time-limited signed URLs that can be used to download
+    all components of a dataset (admin metadata, manifest, README, items,
+    overlays, and annotations) without requiring direct storage backend
+    credentials.
+    """
+    username = get_jwt_identity()
+    uri = unquote(uri)
+    base_uri = _extract_base_uri(uri)
+
+    # Authorization check - user must have search permissions on base URI
+    if not may_search(username, base_uri):
+        logger.warning(
+            f"User {username} denied access to signed URLs for {uri}: "
+            "no search permission on base URI"
+        )
+        abort(403, description="No read access to this base URI")
+
+    # Check dataset exists in dserver
+    if not dataset_uri_exists(uri):
+        logger.warning(f"Dataset not found in dserver: {uri}")
+        abort(404, description="Dataset not found")
+
+    # Get storage broker
+    try:
+        storage_broker = _get_storage_broker(uri)
+    except ValueError as e:
+        logger.error(f"Failed to get storage broker: {e}")
+        abort(501, description=str(e))
+
+    # Generate signed URLs
+    expiry_seconds = Config.SIGNED_URL_READ_EXPIRY_SECONDS
+    try:
+        urls = storage_broker.generate_dataset_signed_urls(expiry_seconds)
+    except Exception as e:
+        logger.error(f"Failed to generate signed URLs for {uri}: {e}")
+        abort(500, description=f"Failed to generate signed URLs: {e}")
+
+    expiry_timestamp = (
+        datetime.utcnow() + timedelta(seconds=expiry_seconds)
+    ).isoformat() + "Z"
+
+    return {
+        'uri': uri,
+        'expiry_seconds': expiry_seconds,
+        'expiry_timestamp': expiry_timestamp,
+        **urls
+    }
+
+
+@signed_url_bp.route("/item/<path:uri>/<identifier>", methods=["GET"])
+@signed_url_bp.response(200, SignedItemURLResponseSchema)
+@jwt_required()
+def get_item_signed_url(uri, identifier):
+    """Get signed URL for a single dataset item.
+
+    Returns a time-limited signed URL for downloading a specific item
+    from a dataset. This is more efficient than getting URLs for the
+    entire dataset when only one item is needed.
+    """
+    username = get_jwt_identity()
+    uri = unquote(uri)
+    base_uri = _extract_base_uri(uri)
+
+    # Authorization check
+    if not may_search(username, base_uri):
+        logger.warning(
+            f"User {username} denied access to signed URL for item {identifier} "
+            f"in {uri}: no search permission on base URI"
+        )
+        abort(403, description="No read access to this base URI")
+
+    # Check dataset exists
+    if not dataset_uri_exists(uri):
+        abort(404, description="Dataset not found")
+
+    # Get storage broker
+    try:
+        storage_broker = _get_storage_broker(uri)
+    except ValueError as e:
+        abort(501, description=str(e))
+
+    # Get manifest to verify item exists
+    try:
+        manifest = storage_broker.get_manifest()
+    except Exception as e:
+        logger.error(f"Failed to get manifest for {uri}: {e}")
+        abort(500, description=f"Failed to get manifest: {e}")
+
+    if identifier not in manifest.get('items', {}):
+        abort(404, description=f"Item {identifier} not found in dataset")
+
+    # Generate signed URL for the item
+    expiry_seconds = Config.SIGNED_URL_READ_EXPIRY_SECONDS
+    try:
+        item_key = storage_broker.data_key_prefix + identifier
+        url = storage_broker.generate_signed_read_url(item_key, expiry_seconds)
+    except Exception as e:
+        logger.error(f"Failed to generate signed URL for item {identifier}: {e}")
+        abort(500, description=f"Failed to generate signed URL: {e}")
+
+    expiry_timestamp = (
+        datetime.utcnow() + timedelta(seconds=expiry_seconds)
+    ).isoformat() + "Z"
+
+    return {
+        'uri': uri,
+        'identifier': identifier,
+        'expiry_seconds': expiry_seconds,
+        'expiry_timestamp': expiry_timestamp,
+        'url': url
+    }
+
+
+@signed_url_bp.route("/upload/<path:base_uri>", methods=["POST"])
+@signed_url_bp.arguments(UploadRequestSchema)
+@signed_url_bp.response(200, UploadURLsResponseSchema)
+@jwt_required()
+def get_upload_signed_urls(request_data, base_uri):
+    """Get signed URLs for uploading a new dataset.
+
+    Returns a set of time-limited signed URLs that can be used to upload
+    all components of a new dataset. After uploading is complete, the
+    client should call the upload-complete endpoint to trigger dataset
+    indexing.
+    """
+    username = get_jwt_identity()
+    base_uri = unquote(base_uri)
+
+    # Authorization check - user must have register permissions
+    if not may_register(username, base_uri):
+        logger.warning(
+            f"User {username} denied upload to {base_uri}: "
+            "no register permission"
+        )
+        abort(403, description="No write access to this base URI")
+
+    uuid = request_data['uuid']
+    name = request_data['name']
+    items = request_data.get('items', [])
+
+    # Generate dataset URI
+    dataset_uri = f"{base_uri}/{uuid}"
+
+    # Check if dataset already exists
+    if dataset_uri_exists(dataset_uri):
+        abort(409, description=f"Dataset {uuid} already exists at {base_uri}")
+
+    # Get storage broker for upload
+    try:
+        storage_broker = _get_storage_broker_for_upload(base_uri, uuid)
+    except ValueError as e:
+        abort(501, description=str(e))
+
+    expiry_seconds = Config.SIGNED_URL_WRITE_EXPIRY_SECONDS
+
+    # Generate upload URLs for dataset structure files
+    try:
+        prefix = uuid + "/"
+        upload_urls = {
+            'admin_metadata': storage_broker.generate_signed_write_url(
+                prefix + "dtool", expiry_seconds),
+            'readme': storage_broker.generate_signed_write_url(
+                prefix + "README.yml", expiry_seconds),
+            'manifest': storage_broker.generate_signed_write_url(
+                prefix + "manifest.json", expiry_seconds),
+            'structure': storage_broker.generate_signed_write_url(
+                prefix + "structure.json", expiry_seconds),
+            'items': {}
+        }
+
+        # Generate URLs for each item
+        for item in items:
+            relpath = item['relpath']
+            identifier = dtoolcore.utils.generate_identifier(relpath)
+            item_key = prefix + "data/" + identifier
+            upload_urls['items'][identifier] = {
+                'url': storage_broker.generate_signed_write_url(
+                    item_key, expiry_seconds),
+                'relpath': relpath
+            }
+
+    except Exception as e:
+        logger.error(f"Failed to generate upload URLs for {dataset_uri}: {e}")
+        abort(500, description=f"Failed to generate upload URLs: {e}")
+
+    expiry_timestamp = (
+        datetime.utcnow() + timedelta(seconds=expiry_seconds)
+    ).isoformat() + "Z"
+
+    return {
+        'uuid': uuid,
+        'uri': dataset_uri,
+        'base_uri': base_uri,
+        'expiry_seconds': expiry_seconds,
+        'expiry_timestamp': expiry_timestamp,
+        'upload_urls': upload_urls
+    }
+
+
+@signed_url_bp.route("/upload-complete", methods=["POST"])
+@signed_url_bp.arguments(UploadCompleteRequestSchema)
+@signed_url_bp.response(200, UploadCompleteResponseSchema)
+@jwt_required()
+def signal_upload_complete(request_data):
+    """Signal that a dataset upload is complete.
+
+    After uploading all dataset components using the signed URLs from
+    the upload endpoint, call this endpoint to trigger dataset indexing
+    and registration in dserver.
+    """
+    username = get_jwt_identity()
+    uri = request_data['uri']
+    base_uri = _extract_base_uri(uri)
+
+    # Authorization check
+    if not may_register(username, base_uri):
+        logger.warning(
+            f"User {username} denied upload-complete for {uri}: "
+            "no register permission"
+        )
+        abort(403, description="No write access to this base URI")
+
+    # Load dataset using dtoolcore to validate it
+    try:
+        dataset = dtoolcore.DataSet.from_uri(uri)
+    except dtoolcore.DtoolCoreTypeError as e:
+        logger.warning(f"Upload complete but dataset invalid: {uri} - {e}")
+        abort(400, description=f"Invalid or incomplete dataset: {e}")
+    except Exception as e:
+        logger.error(f"Failed to load dataset {uri}: {e}")
+        abort(400, description=f"Failed to load dataset: {e}")
+
+    # Generate dataset info for registration
+    try:
+        dataset_info = generate_dataset_info(dataset, base_uri)
+    except Exception as e:
+        logger.error(f"Failed to generate dataset info for {uri}: {e}")
+        abort(500, description=f"Failed to generate dataset info: {e}")
+
+    # Register in dserver
+    try:
+        register_dataset(dataset_info)
+    except Exception as e:
+        logger.error(f"Failed to register dataset {uri}: {e}")
+        abort(500, description=f"Failed to register dataset: {e}")
+
+    logger.info(f"Successfully registered dataset from upload: {uri}")
+
+    return {
+        'uri': uri,
+        'status': 'registered',
+        'name': dataset.name,
+        'uuid': dataset.uuid
+    }
+
+
+class SignedURLExtension(ExtensionABC):
+    """dserver extension for generating signed URLs for dataset access.
+
+    This extension allows dserver to act as a storage access delegate,
+    generating time-limited signed URLs for S3, Azure, and other storage
+    backends. Users can access datasets through dserver without requiring
+    direct backend credentials.
+    """
+
+    def init_app(self, app):
+        """Initialize the extension with the Flask app."""
+        # Register configuration
+        app.config.setdefault(
+            'SIGNED_URL_READ_EXPIRY_SECONDS',
+            Config.SIGNED_URL_READ_EXPIRY_SECONDS
+        )
+        app.config.setdefault(
+            'SIGNED_URL_WRITE_EXPIRY_SECONDS',
+            Config.SIGNED_URL_WRITE_EXPIRY_SECONDS
+        )
+
+        logger.info(
+            f"SignedURLExtension initialized with read_expiry="
+            f"{Config.SIGNED_URL_READ_EXPIRY_SECONDS}s, write_expiry="
+            f"{Config.SIGNED_URL_WRITE_EXPIRY_SECONDS}s"
+        )
+
+    def register_dataset(self, dataset_info):
+        """Called when a dataset is registered - no action needed."""
+        pass
+
+    def get_config(self):
+        """Return initial Config object."""
+        return Config
+
+    def get_config_secrets_to_obfuscate(self):
+        """Return config secrets never to be exposed clear text."""
+        return CONFIG_SECRETS_TO_OBFUSCATE
+
+    def get_blueprint(self):
+        """Return the Flask blueprint for this extension."""
+        return signed_url_bp
