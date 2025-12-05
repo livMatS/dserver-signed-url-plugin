@@ -62,6 +62,72 @@ def _extract_base_uri(uri):
     return uri.rsplit("/", 1)[0]
 
 
+def _rewrite_url(url):
+    """Rewrite URL if host rewriting is configured.
+
+    This is used when dserver runs in a container and the internal
+    hostname (e.g., 'minio') needs to be replaced with an externally
+    accessible hostname (e.g., 'localhost').
+
+    :param url: Original URL
+    :returns: Rewritten URL (or original if no rewrite configured)
+    """
+    rewrite_config = Config.SIGNED_URL_HOST_REWRITE
+    if not rewrite_config:
+        return url
+
+    # Parse the rewrite config - format is "internal:external"
+    # where both can be full URLs like "http://minio:9000" or just "minio:9000"
+    parts = rewrite_config.split(':', 1)
+    if len(parts) != 2:
+        logger.warning(f"Invalid SIGNED_URL_HOST_REWRITE format: {rewrite_config}")
+        return url
+
+    # Handle both "http://minio:9000" -> "http://localhost:9000" format
+    # and simpler cases
+    internal = parts[0]
+    external = parts[1]
+
+    # For URL-style config like "http://minio:9000:http://localhost:9000",
+    # we need to be smarter about parsing
+    if '://' in rewrite_config:
+        # Split on "://" boundaries - find the second protocol marker
+        idx = rewrite_config.find('://', rewrite_config.find('://') + 3)
+        if idx > 0:
+            # There's a second protocol - split there minus one for the colon separator
+            # Format: http://minio:9000:http://localhost:9000
+            # Find where "http" starts after the first URL
+            for i, char in enumerate(rewrite_config):
+                if i > 0 and rewrite_config[i-1] == ':' and rewrite_config[i:i+4] in ('http', 'HTTP'):
+                    internal = rewrite_config[:i-1]
+                    external = rewrite_config[i:]
+                    break
+
+    return url.replace(internal, external, 1)
+
+
+def _rewrite_urls_dict(urls_dict):
+    """Apply URL rewriting to all URLs in a dictionary.
+
+    :param urls_dict: Dictionary potentially containing URL values
+    :returns: Dictionary with rewritten URLs
+    """
+    result = {}
+    for key, value in urls_dict.items():
+        if isinstance(value, str) and ('://' in value):
+            result[key] = _rewrite_url(value)
+        elif isinstance(value, dict):
+            result[key] = _rewrite_urls_dict(value)
+        elif isinstance(value, list):
+            result[key] = [
+                _rewrite_url(v) if isinstance(v, str) and '://' in v else v
+                for v in value
+            ]
+        else:
+            result[key] = value
+    return result
+
+
 def _get_storage_broker(uri):
     """Get storage broker instance for a dataset URI.
 
@@ -100,7 +166,7 @@ def _get_storage_broker_for_upload(base_uri, uuid):
     scheme = parsed.scheme
 
     # Get the storage broker class for this scheme
-    storage_broker_lookup = dtoolcore._get_storage_broker_lookup()
+    storage_broker_lookup = dtoolcore._generate_storage_broker_lookup()
     if scheme not in storage_broker_lookup:
         raise ValueError(f"Unknown storage backend: {scheme}")
 
@@ -165,6 +231,9 @@ def get_dataset_signed_urls(uri):
         logger.error(f"Failed to generate signed URLs for {uri}: {e}")
         abort(500, description=f"Failed to generate signed URLs: {e}")
 
+    # Rewrite URLs if host rewriting is configured
+    urls = _rewrite_urls_dict(urls)
+
     expiry_timestamp = (
         datetime.utcnow() + timedelta(seconds=expiry_seconds)
     ).isoformat() + "Z"
@@ -227,6 +296,9 @@ def get_item_signed_url(uri, identifier):
     except Exception as e:
         logger.error(f"Failed to generate signed URL for item {identifier}: {e}")
         abort(500, description=f"Failed to generate signed URL: {e}")
+
+    # Rewrite URL if host rewriting is configured
+    url = _rewrite_url(url)
 
     expiry_timestamp = (
         datetime.utcnow() + timedelta(seconds=expiry_seconds)
@@ -312,6 +384,9 @@ def get_upload_signed_urls(request_data, base_uri):
     except Exception as e:
         logger.error(f"Failed to generate upload URLs for {dataset_uri}: {e}")
         abort(500, description=f"Failed to generate upload URLs: {e}")
+
+    # Rewrite URLs if host rewriting is configured
+    upload_urls = _rewrite_urls_dict(upload_urls)
 
     expiry_timestamp = (
         datetime.utcnow() + timedelta(seconds=expiry_seconds)
