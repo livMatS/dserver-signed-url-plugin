@@ -1,16 +1,17 @@
 [build-system]
-requires = ["setuptools>=42", "setuptools_scm[toml]>=6.3"]
-build-backend = "setuptools.build_meta"
+requires = ["flit_scm"]
+build-backend = "flit_scm:buildapi"
 
 [project]
 name = "dserver-signed-url-plugin"
 description = "dserver plugin for generating signed URLs for dataset access"
 readme = "README.rst"
-license = {file = "LICENSE"}
+license = {text = "MIT"}
 authors = [
     {name = "Lars Pastewka", email = "lars.pastewka@imtek.uni-freiburg.de"},
 ]
 dynamic = ["version"]
+requires-python = ">=3.8"
 dependencies = [
     "dtoolcore>=3.18.0",
     "dtool-s3",
@@ -32,13 +33,17 @@ azure = [
 [project.urls]
 Repository = "https://github.com/livMatS/dserver-signed-url-plugin"
 
+[project.entry-points."dservercore.extension"]
+SignedURLExtension = "dserver_signed_url_plugin:SignedURLExtension"
+
+[tool.flit.module]
+name = "dserver_signed_url_plugin"
+
 [tool.setuptools_scm]
 version_scheme = "guess-next-dev"
 local_scheme = "no-local-version"
 write_to = "dserver_signed_url_plugin/version.py"
 
-[tool.setuptools]
-packages = ["dserver_signed_url_plugin"]
-
-[project.entry-points."dservercore.extension"]
-"SignedURLExtension" = "dserver_signed_url_plugin:SignedURLExtension"
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=dserver_signed_url_plugin --cov-report=term-missing"
