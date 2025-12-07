@@ -11,8 +11,9 @@ except PackageNotFoundError:
     # package is not installed
     pass
 
+import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote
 
 import dtoolcore
@@ -320,10 +321,12 @@ def get_item_signed_url(uri, identifier):
 def get_upload_signed_urls(request_data, base_uri):
     """Get signed URLs for uploading a new dataset.
 
-    Returns a set of time-limited signed URLs that can be used to upload
-    all components of a new dataset. After uploading is complete, the
-    client should call the upload-complete endpoint to trigger dataset
-    indexing.
+    The server writes admin_metadata, manifest, structure, tags, and annotations
+    directly to storage based on the provided metadata. Only README and items
+    need to be uploaded by the client using the returned signed URLs.
+
+    After uploading README and items, the client should call the upload-complete
+    endpoint to trigger dataset indexing.
     """
     username = get_jwt_identity()
     base_uri = unquote(base_uri)
@@ -338,7 +341,11 @@ def get_upload_signed_urls(request_data, base_uri):
 
     uuid = request_data['uuid']
     name = request_data['name']
+    creator_username = request_data['creator_username']
+    frozen_at = request_data['frozen_at']
     items = request_data.get('items', [])
+    tags = request_data.get('tags', [])
+    annotations = request_data.get('annotations', {})
 
     # Generate dataset URI
     dataset_uri = f"{base_uri}/{uuid}"
@@ -354,19 +361,91 @@ def get_upload_signed_urls(request_data, base_uri):
         abort(501, description=str(e))
 
     expiry_seconds = Config.SIGNED_URL_WRITE_EXPIRY_SECONDS
+    prefix = uuid + "/"
 
-    # Generate upload URLs for dataset structure files
     try:
-        prefix = uuid + "/"
+        # Build admin metadata
+        admin_metadata = {
+            "uuid": uuid,
+            "dtoolcore_version": dtoolcore.__version__,
+            "name": name,
+            "type": "dataset",
+            "creator_username": creator_username,
+            "frozen_at": frozen_at,
+        }
+
+        # Build manifest with items
+        manifest_items = {}
+        for item in items:
+            relpath = item['relpath']
+            identifier = dtoolcore.utils.generate_identifier(relpath)
+            manifest_items[identifier] = {
+                "relpath": relpath,
+                "size_in_bytes": item['size_in_bytes'],
+                "hash": item['hash'],
+                "utc_timestamp": item['utc_timestamp'],
+            }
+
+        manifest = {
+            "dtoolcore_version": dtoolcore.__version__,
+            "hash_function": "md5sum_hexdigest",
+            "items": manifest_items,
+        }
+
+        # Structure parameters (server-defined, appropriate for the backend)
+        structure_parameters = {
+            "data_key_infix": "data",
+            "fragment_key_infix": "fragments",
+            "overlays_key_infix": "overlays",
+            "annotations_key_infix": "annotations",
+            "tags_key_infix": "tags",
+            "structure_key_suffix": "structure.json",
+            "dtool_readme_key_suffix": "README.txt",
+            "dataset_readme_key_suffix": "README.yml",
+            "manifest_key_suffix": "manifest.json",
+            "admin_metadata_key_suffix": "dtool",
+            "http_manifest_key": "http_manifest.json",
+            "storage_broker_version": dtoolcore.__version__,
+        }
+
+        # Write admin metadata directly to storage
+        logger.debug(f"Writing admin metadata for {dataset_uri}")
+        storage_broker.put_text(
+            prefix + "dtool",
+            json.dumps(admin_metadata)
+        )
+
+        # Write manifest directly to storage
+        logger.debug(f"Writing manifest for {dataset_uri}")
+        storage_broker.put_text(
+            prefix + "manifest.json",
+            json.dumps(manifest)
+        )
+
+        # Write structure.json directly to storage
+        logger.debug(f"Writing structure.json for {dataset_uri}")
+        storage_broker.put_text(
+            prefix + "structure.json",
+            json.dumps(structure_parameters, indent=2, sort_keys=True)
+        )
+
+        # Write tags directly to storage (empty files)
+        for tag in tags:
+            logger.debug(f"Writing tag '{tag}' for {dataset_uri}")
+            storage_broker.put_text(prefix + "tags/" + tag, "")
+
+        # Write annotations directly to storage (JSON files)
+        for annotation_name, annotation_value in annotations.items():
+            logger.debug(f"Writing annotation '{annotation_name}' for {dataset_uri}")
+            storage_broker.put_text(
+                prefix + "annotations/" + annotation_name + ".json",
+                json.dumps(annotation_value, indent=2)
+            )
+
+        # Generate signed URLs only for README and items
         upload_urls = {
-            'admin_metadata': storage_broker.generate_signed_write_url(
-                prefix + "dtool", expiry_seconds),
             'readme': storage_broker.generate_signed_write_url(
                 prefix + "README.yml", expiry_seconds),
-            'manifest': storage_broker.generate_signed_write_url(
-                prefix + "manifest.json", expiry_seconds),
-            'structure': storage_broker.generate_signed_write_url(
-                prefix + "structure.json", expiry_seconds),
             'items': {}
         }
 
@@ -382,15 +461,15 @@ def get_upload_signed_urls(request_data, base_uri):
             }
 
     except Exception as e:
-        logger.error(f"Failed to generate upload URLs for {dataset_uri}: {e}")
-        abort(500, description=f"Failed to generate upload URLs: {e}")
+        logger.error(f"Failed to process upload request for {dataset_uri}: {e}")
+        abort(500, description=f"Failed to process upload request: {e}")
 
     # Rewrite URLs if host rewriting is configured
     upload_urls = _rewrite_urls_dict(upload_urls)
 
     expiry_timestamp = (
-        datetime.utcnow() + timedelta(seconds=expiry_seconds)
-    ).isoformat() + "Z"
+        datetime.now(timezone.utc) + timedelta(seconds=expiry_seconds)
+    ).isoformat()
 
     return {
         'uuid': uuid,

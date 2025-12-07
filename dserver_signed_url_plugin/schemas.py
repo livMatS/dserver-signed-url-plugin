@@ -27,16 +27,27 @@ class SignedItemURLResponseSchema(Schema):
 
 
 class UploadItemSchema(Schema):
-    """Schema for an item to upload."""
+    """Schema for an item to upload - includes full metadata for manifest generation."""
     relpath = fields.Str(required=True, metadata={"description": "Relative path of the item"})
-    size_hint = fields.Int(metadata={"description": "Optional size hint in bytes"})
+    size_in_bytes = fields.Int(required=True, metadata={"description": "Size of the item in bytes"})
+    hash = fields.Str(required=True, metadata={"description": "Hash of the item content"})
+    utc_timestamp = fields.Float(required=True, metadata={"description": "UTC timestamp of the item"})
 
 
 class UploadRequestSchema(Schema):
-    """Schema for upload URL request."""
+    """Schema for upload URL request.
+
+    The server uses this metadata to create admin_metadata, manifest, structure,
+    tags, and annotations directly in storage. Only README and items need
+    separate uploads via signed URLs.
+    """
     uuid = fields.Str(required=True, metadata={"description": "Dataset UUID"})
     name = fields.Str(required=True, metadata={"description": "Dataset name"})
-    items = fields.List(fields.Nested(UploadItemSchema), metadata={"description": "List of items to upload"})
+    creator_username = fields.Str(required=True, metadata={"description": "Username of the dataset creator"})
+    frozen_at = fields.Float(required=True, metadata={"description": "UTC timestamp when dataset was frozen"})
+    items = fields.List(fields.Nested(UploadItemSchema), metadata={"description": "List of items with full metadata"})
+    tags = fields.List(fields.Str(), load_default=[], metadata={"description": "List of tags"})
+    annotations = fields.Dict(keys=fields.Str(), values=fields.Raw(), load_default={}, metadata={"description": "Annotations as key-value pairs"})
 
 
 class UploadItemURLSchema(Schema):
@@ -46,11 +57,12 @@ class UploadItemURLSchema(Schema):
 
 
 class UploadURLsSchema(Schema):
-    """Schema for upload structure URLs."""
-    admin_metadata = fields.Str(required=True, metadata={"description": "Signed URL for admin metadata"})
+    """Schema for upload structure URLs.
+
+    Only includes URLs for README and items - other metadata is written
+    directly by the server.
+    """
     readme = fields.Str(required=True, metadata={"description": "Signed URL for README"})
-    manifest = fields.Str(required=True, metadata={"description": "Signed URL for manifest"})
-    structure = fields.Str(required=True, metadata={"description": "Signed URL for structure"})
     items = fields.Dict(keys=fields.Str(), values=fields.Nested(UploadItemURLSchema), metadata={"description": "Item identifier to upload URL mapping"})
 
 
