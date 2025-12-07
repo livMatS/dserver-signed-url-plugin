@@ -153,42 +153,6 @@ def _get_storage_broker(uri):
     return storage_broker
 
 
-def _get_storage_broker_for_upload(base_uri, uuid):
-    """Get storage broker instance for uploading a new dataset.
-
-    This creates a broker for a dataset that doesn't exist yet.
-
-    :param base_uri: Base URI (e.g., s3://bucket)
-    :param uuid: Dataset UUID
-    :returns: Storage broker instance
-    """
-    # Parse the base URI to get the scheme
-    parsed = dtoolcore.utils.generous_parse_uri(base_uri)
-    scheme = parsed.scheme
-
-    # Get the storage broker class for this scheme
-    storage_broker_lookup = dtoolcore._generate_storage_broker_lookup()
-    if scheme not in storage_broker_lookup:
-        raise ValueError(f"Unknown storage backend: {scheme}")
-
-    StorageBrokerClass = storage_broker_lookup[scheme]
-
-    # Generate the full URI
-    uri = f"{base_uri}/{uuid}"
-
-    # Create broker instance
-    storage_broker = StorageBrokerClass(uri, config_path=Config.DTOOL_CONFIG_PATH)
-
-    # Check if broker supports signing
-    if not hasattr(storage_broker, 'generate_signed_write_url'):
-        raise ValueError(
-            f"Storage broker {StorageBrokerClass.__name__} does not support "
-            "signed URL generation for writes"
-        )
-
-    return storage_broker
-
-
 @signed_url_bp.route("/dataset/<path:uri>", methods=["GET"])
 @signed_url_bp.response(200, SignedURLsResponseSchema)
 @jwt_required()
@@ -322,8 +286,9 @@ def get_upload_signed_urls(request_data, base_uri):
     """Get signed URLs for uploading a new dataset.
 
     The server writes admin_metadata, manifest, structure, tags, and annotations
-    directly to storage based on the provided metadata. Only README and items
-    need to be uploaded by the client using the returned signed URLs.
+    directly to storage based on the provided metadata using dtoolcore's
+    create_frozen_dataset function. Only README and items need to be uploaded
+    by the client using the returned signed URLs.
 
     After uploading README and items, the client should call the upload-complete
     endpoint to trigger dataset indexing.
@@ -354,26 +319,9 @@ def get_upload_signed_urls(request_data, base_uri):
     if dataset_uri_exists(dataset_uri):
         abort(409, description=f"Dataset {uuid} already exists at {base_uri}")
 
-    # Get storage broker for upload
-    try:
-        storage_broker = _get_storage_broker_for_upload(base_uri, uuid)
-    except ValueError as e:
-        abort(501, description=str(e))
-
     expiry_seconds = Config.SIGNED_URL_WRITE_EXPIRY_SECONDS
-    prefix = uuid + "/"
 
     try:
-        # Build admin metadata
-        admin_metadata = {
-            "uuid": uuid,
-            "dtoolcore_version": dtoolcore.__version__,
-            "name": name,
-            "type": "dataset",
-            "creator_username": creator_username,
-            "frozen_at": frozen_at,
-        }
-
         # Build manifest with items
         manifest_items = {}
         for item in items:
@@ -392,60 +340,31 @@ def get_upload_signed_urls(request_data, base_uri):
             "items": manifest_items,
         }
 
-        # Structure parameters (server-defined, appropriate for the backend)
-        structure_parameters = {
-            "data_key_infix": "data",
-            "fragment_key_infix": "fragments",
-            "overlays_key_infix": "overlays",
-            "annotations_key_infix": "annotations",
-            "tags_key_infix": "tags",
-            "structure_key_suffix": "structure.json",
-            "dtool_readme_key_suffix": "README.txt",
-            "dataset_readme_key_suffix": "README.yml",
-            "manifest_key_suffix": "manifest.json",
-            "admin_metadata_key_suffix": "dtool",
-            "http_manifest_key": "http_manifest.json",
-            "storage_broker_version": dtoolcore.__version__,
-        }
-
-        # Write admin metadata directly to storage
-        logger.debug(f"Writing admin metadata for {dataset_uri}")
-        storage_broker.put_text(
-            prefix + "dtool",
-            json.dumps(admin_metadata)
+        # Create the frozen dataset using dtoolcore
+        # This writes admin_metadata, manifest, structure, tags, and annotations
+        # README content is empty - it will be uploaded via signed URL
+        logger.debug(f"Creating frozen dataset {dataset_uri}")
+        dataset = dtoolcore.create_frozen_dataset(
+            base_uri=base_uri,
+            uuid=uuid,
+            name=name,
+            creator_username=creator_username,
+            frozen_at=frozen_at,
+            manifest=manifest,
+            readme_content="",  # Will be uploaded separately
+            tags=tags if tags else None,
+            annotations=annotations if annotations else None,
+            config_path=Config.DTOOL_CONFIG_PATH
         )
 
-        # Write manifest directly to storage
-        logger.debug(f"Writing manifest for {dataset_uri}")
-        storage_broker.put_text(
-            prefix + "manifest.json",
-            json.dumps(manifest)
-        )
-
-        # Write structure.json directly to storage
-        logger.debug(f"Writing structure.json for {dataset_uri}")
-        storage_broker.put_text(
-            prefix + "structure.json",
-            json.dumps(structure_parameters, indent=2, sort_keys=True)
-        )
-
-        # Write tags directly to storage (empty files)
-        for tag in tags:
-            logger.debug(f"Writing tag '{tag}' for {dataset_uri}")
-            storage_broker.put_text(prefix + "tags/" + tag, "")
-
-        # Write annotations directly to storage (JSON files)
-        for annotation_name, annotation_value in annotations.items():
-            logger.debug(f"Writing annotation '{annotation_name}' for {dataset_uri}")
-            storage_broker.put_text(
-                prefix + "annotations/" + annotation_name + ".json",
-                json.dumps(annotation_value, indent=2)
-            )
+        # Get storage broker from the created dataset to generate signed URLs
+        storage_broker = dataset._storage_broker
+        prefix = uuid + "/"
 
         # Generate signed URLs only for README and items
         upload_urls = {
             'readme': storage_broker.generate_signed_write_url(
-                prefix + "README.yml", expiry_seconds),
+                storage_broker.get_readme_key(), expiry_seconds),
             'items': {}
         }
 
@@ -453,13 +372,19 @@ def get_upload_signed_urls(request_data, base_uri):
         for item in items:
             relpath = item['relpath']
             identifier = dtoolcore.utils.generate_identifier(relpath)
-            item_key = prefix + "data/" + identifier
+            item_key = storage_broker.data_key_prefix + identifier
             upload_urls['items'][identifier] = {
                 'url': storage_broker.generate_signed_write_url(
                     item_key, expiry_seconds),
                 'relpath': relpath
             }
 
+    except dtoolcore.DtoolCoreInvalidNameError as e:
+        logger.warning(f"Invalid name in upload request for {dataset_uri}: {e}")
+        abort(400, description=str(e))
+    except dtoolcore.DtoolCoreValueError as e:
+        logger.warning(f"Invalid value in upload request for {dataset_uri}: {e}")
+        abort(400, description=str(e))
     except Exception as e:
         logger.error(f"Failed to process upload request for {dataset_uri}: {e}")
         abort(500, description=f"Failed to process upload request: {e}")
