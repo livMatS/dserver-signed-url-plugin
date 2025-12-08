@@ -289,7 +289,7 @@ def get_dataset_signed_urls(uri):
             f"User {username} denied access to signed URLs for {uri}: "
             "no search permission on base URI"
         )
-        abort(403, description="No read access to this base URI")
+        abort(403, description="You do not have search permission for this base URI. Please contact an administrator.")
 
     # Check dataset exists in dserver
     if not dataset_uri_exists(uri):
@@ -346,7 +346,7 @@ def get_item_signed_url(uri, identifier):
             f"User {username} denied access to signed URL for item {identifier} "
             f"in {uri}: no search permission on base URI"
         )
-        abort(403, description="No read access to this base URI")
+        abort(403, description="You do not have search permission for this base URI. Please contact an administrator.")
 
     # Check dataset exists
     if not dataset_uri_exists(uri):
@@ -416,7 +416,7 @@ def get_upload_signed_urls(request_data, base_uri):
             f"User {username} denied upload to {base_uri}: "
             "no register permission"
         )
-        abort(403, description="No write access to this base URI")
+        abort(403, description="You do not have register permission for this base URI. Please contact an administrator.")
 
     dataset_uuid = request_data['uuid']
     name = request_data['name']
@@ -573,7 +573,7 @@ def signal_upload_complete(request_data):
             f"User {username} denied upload-complete for {uri}: "
             "no register permission"
         )
-        abort(403, description="No write access to this base URI")
+        abort(403, description="You do not have register permission for this base URI. Please contact an administrator.")
 
     # Check if we have pending upload data for this UUID in the database
     pending_upload = PendingUpload.query.filter_by(uuid=dataset_uuid).first()
