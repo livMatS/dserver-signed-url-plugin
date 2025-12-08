@@ -1,6 +1,5 @@
 """Database models for pending uploads."""
 
-import json
 from datetime import datetime, timezone
 
 from dservercore import sql_db as db
@@ -29,20 +28,10 @@ class PendingUpload(db.Model):
     creator_username = db.Column(db.String(255), nullable=False)
     created_at = db.Column(db.DateTime(), nullable=False, default=lambda: datetime.now(timezone.utc))
     frozen_at = db.Column(db.Float, nullable=False)  # Timestamp to use when freezing
-    manifest_json = db.Column(db.Text, nullable=False)  # JSON-serialized manifest
+    manifest = db.Column(db.JSON, nullable=False)  # Native JSON field for manifest
 
     def __repr__(self):
         return f"<PendingUpload {self.uuid} ({self.name})>"
-
-    @property
-    def manifest(self):
-        """Deserialize the manifest from JSON."""
-        return json.loads(self.manifest_json)
-
-    @manifest.setter
-    def manifest(self, value):
-        """Serialize the manifest to JSON."""
-        self.manifest_json = json.dumps(value)
 
     def as_dict(self):
         """Return pending upload as dictionary."""

@@ -496,8 +496,8 @@ def get_upload_signed_urls(request_data, base_uri):
             name=name,
             creator_username=creator_username,
             frozen_at=frozen_at,
+            manifest=manifest,
         )
-        pending_upload.manifest = manifest
         sql_db.session.add(pending_upload)
         sql_db.session.commit()
 
