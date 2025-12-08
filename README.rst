@@ -388,6 +388,136 @@ provides a standard dtool interface backed by this plugin::
     # Create a new dataset through dserver
     dtool create dserver://localhost:5000/s3/my-bucket/my-dataset
 
+Pending Upload Management
+-------------------------
+
+When a client initiates a dataset upload, a proto-dataset is created in storage
+and a record is stored in the database to track the pending upload. This allows
+the server to:
+
+1. Detect incomplete/abandoned uploads
+2. Persist upload state across server restarts
+3. Clean up stale uploads
+
+Database Model
+~~~~~~~~~~~~~~
+
+The plugin adds a ``pending_upload`` table to the dserver database with the
+following fields:
+
+- ``uuid``: Dataset UUID (unique)
+- ``uri``: Full dataset URI
+- ``base_uri``: Base URI for the dataset
+- ``name``: Dataset name
+- ``creator_username``: Who initiated the upload
+- ``created_at``: When the upload was initiated
+- ``frozen_at``: Timestamp to use when freezing
+- ``manifest_json``: JSON-serialized manifest data
+
+After deploying this plugin, run database migrations to create the table::
+
+    flask db migrate -m "Add pending_upload table"
+    flask db upgrade
+
+CLI Commands
+~~~~~~~~~~~~
+
+The plugin provides Flask CLI commands for managing pending uploads:
+
+**List pending uploads**::
+
+    # List all pending uploads
+    flask pending_upload list
+
+    # List uploads older than 24 hours
+    flask pending_upload list --older-than 24
+
+Output example::
+
+    Found 2 pending upload(s):
+
+      UUID: 550e8400-e29b-41d4-a716-446655440000
+      Name: my-dataset
+      URI: s3://bucket/550e8400-e29b-41d4-a716-446655440000
+      Creator: admin
+      Created: 2024-01-15T10:30:00 (26.5 hours ago)
+      Items: 5
+
+      UUID: 660e8400-e29b-41d4-a716-446655440001
+      Name: another-dataset
+      URI: s3://bucket/660e8400-e29b-41d4-a716-446655440001
+      Creator: user1
+      Created: 2024-01-15T12:00:00 (25.0 hours ago)
+      Items: 3
+
+**Clean up stale uploads**::
+
+    # Preview what would be deleted (dry run)
+    flask pending_upload cleanup --older-than 48 --dry-run
+
+    # Actually delete uploads older than 48 hours
+    flask pending_upload cleanup --older-than 48
+
+    # Also attempt to delete proto-datasets from storage
+    flask pending_upload cleanup --older-than 48 --delete-storage
+
+**Delete a specific pending upload**::
+
+    # Delete by UUID
+    flask pending_upload delete 550e8400-e29b-41d4-a716-446655440000
+
+    # Also attempt to delete from storage
+    flask pending_upload delete 550e8400-e29b-41d4-a716-446655440000 --delete-storage
+
+Docker Compose Usage
+~~~~~~~~~~~~~~~~~~~~
+
+When running dserver in Docker Compose::
+
+    # List pending uploads
+    docker compose exec dserver flask pending_upload list
+
+    # Clean up uploads older than 24 hours
+    docker compose exec dserver flask pending_upload cleanup --older-than 24
+
+Automated Cleanup
+~~~~~~~~~~~~~~~~~
+
+For production deployments, consider setting up a cron job or scheduled task
+to periodically clean up stale pending uploads::
+
+    # Run daily at 2 AM to clean up uploads older than 48 hours
+    0 2 * * * docker compose exec -T dserver flask pending_upload cleanup --older-than 48
+
+Upload Workflow
+~~~~~~~~~~~~~~~
+
+The upload process works as follows:
+
+1. **Upload initiation** (``POST /signed-urls/upload/<base_uri>``):
+
+   - Creates a proto-dataset in storage (type: ``protodataset``)
+   - Stores manifest and metadata in ``pending_upload`` table
+   - Returns signed URLs for README and item uploads
+
+2. **Data upload** (client-side):
+
+   - Client uploads README and items using signed URLs
+   - Client computes hashes during upload
+
+3. **Upload completion** (``POST /signed-urls/upload-complete``):
+
+   - Retrieves pending upload record from database
+   - Freezes proto-dataset with stored manifest (type: ``dataset``)
+   - Registers dataset in dserver
+   - Deletes pending upload record
+
+This architecture provides clear visibility into upload state:
+
+- **Proto-datasets** (``type: protodataset``) indicate incomplete uploads
+- **Datasets** (``type: dataset``) indicate completed, frozen datasets
+- **Pending upload records** track uploads in progress
+
 Security Considerations
 -----------------------
 

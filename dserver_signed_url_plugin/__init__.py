@@ -16,13 +16,15 @@ import logging
 from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote
 
+import click
 import dtoolcore
 import dtoolcore.utils
 
 from flask import abort, current_app, jsonify
+from flask.cli import AppGroup
 from flask_smorest import Blueprint
 
-from dservercore import ExtensionABC
+from dservercore import ExtensionABC, sql_db
 from dservercore.utils import (
     register_dataset,
     generate_dataset_info,
@@ -44,6 +46,7 @@ from .schemas import (
     UploadCompleteRequestSchema,
     UploadCompleteResponseSchema,
 )
+from .sql_models import PendingUpload
 
 
 logger = logging.getLogger(__name__)
@@ -56,6 +59,118 @@ signed_url_bp = Blueprint(
     url_prefix="/signed-urls",
     description="Endpoints for generating signed URLs for dataset access"
 )
+
+# Create CLI command group for pending upload management
+pending_upload_cli = AppGroup(
+    "pending_upload",
+    help="Pending upload management commands."
+)
+
+
+@pending_upload_cli.command(name="list")
+@click.option("--older-than", type=int, default=None,
+              help="Only show uploads older than N hours")
+def list_pending_uploads(older_than):
+    """List all pending uploads."""
+    query = PendingUpload.query
+
+    if older_than is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=older_than)
+        query = query.filter(PendingUpload.created_at < cutoff)
+
+    pending = query.all()
+
+    if not pending:
+        click.echo("No pending uploads found.")
+        return
+
+    click.echo(f"Found {len(pending)} pending upload(s):\n")
+    for p in pending:
+        age = datetime.now(timezone.utc) - p.created_at.replace(tzinfo=timezone.utc)
+        age_hours = age.total_seconds() / 3600
+        click.echo(f"  UUID: {p.uuid}")
+        click.echo(f"  Name: {p.name}")
+        click.echo(f"  URI: {p.uri}")
+        click.echo(f"  Creator: {p.creator_username}")
+        click.echo(f"  Created: {p.created_at.isoformat()} ({age_hours:.1f} hours ago)")
+        click.echo(f"  Items: {len(p.manifest.get('items', {}))}")
+        click.echo()
+
+
+@pending_upload_cli.command(name="cleanup")
+@click.option("--older-than", type=int, required=True,
+              help="Delete uploads older than N hours")
+@click.option("--dry-run", is_flag=True,
+              help="Show what would be deleted without actually deleting")
+@click.option("--delete-storage", is_flag=True,
+              help="Also delete the proto-dataset from storage")
+def cleanup_pending_uploads(older_than, dry_run, delete_storage):
+    """Clean up stale pending uploads.
+
+    This removes pending upload records from the database. Optionally,
+    it can also delete the associated proto-datasets from storage.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=older_than)
+    pending = PendingUpload.query.filter(PendingUpload.created_at < cutoff).all()
+
+    if not pending:
+        click.echo(f"No pending uploads older than {older_than} hours found.")
+        return
+
+    click.echo(f"Found {len(pending)} pending upload(s) older than {older_than} hours:")
+
+    for p in pending:
+        click.echo(f"  - {p.uuid} ({p.name})")
+
+        if delete_storage and not dry_run:
+            try:
+                # Try to delete the proto-dataset from storage
+                proto = dtoolcore.ProtoDataSet.from_uri(p.uri)
+                # Note: dtoolcore doesn't have a delete method for proto-datasets
+                # This would need storage-broker specific implementation
+                click.secho(f"    Warning: Storage deletion not implemented", fg="yellow")
+            except Exception as e:
+                click.secho(f"    Warning: Could not access storage: {e}", fg="yellow")
+
+    if dry_run:
+        click.echo("\nDry run - no changes made.")
+        return
+
+    # Delete from database
+    for p in pending:
+        sql_db.session.delete(p)
+
+    sql_db.session.commit()
+    click.secho(f"\nDeleted {len(pending)} pending upload record(s) from database.", fg="green")
+
+
+@pending_upload_cli.command(name="delete")
+@click.argument("uuid")
+@click.option("--delete-storage", is_flag=True,
+              help="Also delete the proto-dataset from storage")
+def delete_pending_upload(uuid, delete_storage):
+    """Delete a specific pending upload by UUID."""
+    pending = PendingUpload.query.filter_by(uuid=uuid).first()
+
+    if pending is None:
+        click.secho(f"No pending upload found with UUID: {uuid}", fg="red")
+        return
+
+    click.echo(f"Deleting pending upload:")
+    click.echo(f"  UUID: {pending.uuid}")
+    click.echo(f"  Name: {pending.name}")
+    click.echo(f"  URI: {pending.uri}")
+
+    if delete_storage:
+        try:
+            proto = dtoolcore.ProtoDataSet.from_uri(pending.uri)
+            click.secho("  Warning: Storage deletion not implemented", fg="yellow")
+        except Exception as e:
+            click.secho(f"  Warning: Could not access storage: {e}", fg="yellow")
+
+    sql_db.session.delete(pending)
+    sql_db.session.commit()
+    click.secho(f"\nDeleted pending upload record from database.", fg="green")
 
 
 def _extract_base_uri(uri):
@@ -278,12 +393,6 @@ def get_item_signed_url(uri, identifier):
     }
 
 
-# In-memory store for pending uploads
-# Maps dataset UUID to manifest data needed for freezing
-# In production, this should use Redis or a database table
-_pending_uploads = {}
-
-
 @signed_url_bp.route("/upload/<path:base_uri>", methods=["POST"])
 @signed_url_bp.arguments(UploadRequestSchema)
 @signed_url_bp.response(200, UploadURLsResponseSchema)
@@ -379,12 +488,18 @@ def get_upload_signed_urls(request_data, base_uri):
             for ann_name, ann_value in annotations.items():
                 proto_dataset.put_annotation(ann_name, ann_value)
 
-        # Store manifest and frozen_at for use when freezing
-        _pending_uploads[dataset_uuid] = {
-            'manifest': manifest,
-            'frozen_at': frozen_at,
-            'uri': proto_dataset.uri,
-        }
+        # Store pending upload in database for use when freezing
+        pending_upload = PendingUpload(
+            uuid=dataset_uuid,
+            uri=proto_dataset.uri,
+            base_uri=base_uri,
+            name=name,
+            creator_username=creator_username,
+            frozen_at=frozen_at,
+        )
+        pending_upload.manifest = manifest
+        sql_db.session.add(pending_upload)
+        sql_db.session.commit()
 
         # Get storage broker from the created proto-dataset to generate signed URLs
         storage_broker = proto_dataset._storage_broker
@@ -460,14 +575,14 @@ def signal_upload_complete(request_data):
         )
         abort(403, description="No write access to this base URI")
 
-    # Check if we have pending upload data for this UUID
-    if dataset_uuid not in _pending_uploads:
+    # Check if we have pending upload data for this UUID in the database
+    pending_upload = PendingUpload.query.filter_by(uuid=dataset_uuid).first()
+    if pending_upload is None:
         logger.warning(f"No pending upload found for {uri}")
         abort(400, description="No pending upload found for this dataset")
 
-    pending_data = _pending_uploads[dataset_uuid]
-    manifest = pending_data['manifest']
-    frozen_at = pending_data['frozen_at']
+    manifest = pending_upload.manifest
+    frozen_at = pending_upload.frozen_at
 
     # Load proto-dataset and freeze it
     try:
@@ -513,8 +628,9 @@ def signal_upload_complete(request_data):
         logger.error(f"Failed to register dataset {uri}: {e}")
         abort(500, description=f"Failed to register dataset: {e}")
 
-    # Clean up pending upload data
-    del _pending_uploads[dataset_uuid]
+    # Clean up pending upload record from database
+    sql_db.session.delete(pending_upload)
+    sql_db.session.commit()
 
     logger.info(f"Successfully registered dataset from upload: {uri}")
 
@@ -546,6 +662,9 @@ class SignedURLExtension(ExtensionABC):
             'SIGNED_URL_WRITE_EXPIRY_SECONDS',
             Config.SIGNED_URL_WRITE_EXPIRY_SECONDS
         )
+
+        # Register CLI commands for pending upload management
+        app.cli.add_command(pending_upload_cli)
 
         logger.info(
             f"SignedURLExtension initialized with read_expiry="
