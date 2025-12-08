@@ -278,6 +278,12 @@ def get_item_signed_url(uri, identifier):
     }
 
 
+# In-memory store for pending uploads
+# Maps dataset UUID to manifest data needed for freezing
+# In production, this should use Redis or a database table
+_pending_uploads = {}
+
+
 @signed_url_bp.route("/upload/<path:base_uri>", methods=["POST"])
 @signed_url_bp.arguments(UploadRequestSchema)
 @signed_url_bp.response(200, UploadURLsResponseSchema)
@@ -285,13 +291,12 @@ def get_item_signed_url(uri, identifier):
 def get_upload_signed_urls(request_data, base_uri):
     """Get signed URLs for uploading a new dataset.
 
-    The server writes admin_metadata, manifest, structure, tags, and annotations
-    directly to storage based on the provided metadata using dtoolcore's
-    create_frozen_dataset function. Only README and items need to be uploaded
-    by the client using the returned signed URLs.
+    The server creates a proto-dataset in storage and returns signed URLs
+    for uploading README and items. The proto-dataset is not yet frozen,
+    allowing detection of incomplete uploads.
 
     After uploading README and items, the client should call the upload-complete
-    endpoint to trigger dataset indexing.
+    endpoint to freeze the dataset and trigger registration.
     """
     username = get_jwt_identity()
     base_uri = unquote(base_uri)
@@ -304,7 +309,7 @@ def get_upload_signed_urls(request_data, base_uri):
         )
         abort(403, description="No write access to this base URI")
 
-    uuid = request_data['uuid']
+    dataset_uuid = request_data['uuid']
     name = request_data['name']
     creator_username = request_data['creator_username']
     frozen_at = request_data['frozen_at']
@@ -313,16 +318,16 @@ def get_upload_signed_urls(request_data, base_uri):
     annotations = request_data.get('annotations', {})
 
     # Generate dataset URI
-    dataset_uri = f"{base_uri}/{uuid}"
+    dataset_uri = f"{base_uri}/{dataset_uuid}"
 
     # Check if dataset already exists
     if dataset_uri_exists(dataset_uri):
-        abort(409, description=f"Dataset {uuid} already exists at {base_uri}")
+        abort(409, description=f"Dataset {dataset_uuid} already exists at {base_uri}")
 
     expiry_seconds = Config.SIGNED_URL_WRITE_EXPIRY_SECONDS
 
     try:
-        # Build manifest with items
+        # Build manifest with items (will be used when freezing)
         manifest_items = {}
         for item in items:
             relpath = item['relpath']
@@ -340,28 +345,51 @@ def get_upload_signed_urls(request_data, base_uri):
             "items": manifest_items,
         }
 
-        # Create the frozen dataset using dtoolcore
-        # This writes admin_metadata, manifest, structure, tags, and annotations
-        # README content is empty - it will be uploaded via signed URL
-        logger.debug(f"Creating frozen dataset {dataset_uri}")
-        dataset = dtoolcore.create_frozen_dataset(
+        # Create a proto-dataset (not frozen yet)
+        # This allows us to detect incomplete uploads
+        logger.debug(f"Creating proto-dataset {dataset_uri}")
+
+        # Build admin metadata with the client-provided UUID
+        admin_metadata = {
+            "uuid": dataset_uuid,
+            "dtoolcore_version": dtoolcore.__version__,
+            "name": name,
+            "type": "protodataset",
+            "creator_username": creator_username,
+            "created_at": dtoolcore.utils.timestamp(
+                datetime.now(timezone.utc)
+            ),
+        }
+
+        # Create proto-dataset with custom admin metadata
+        proto_dataset = dtoolcore.generate_proto_dataset(
+            admin_metadata=admin_metadata,
             base_uri=base_uri,
-            uuid=uuid,
-            name=name,
-            creator_username=creator_username,
-            frozen_at=frozen_at,
-            manifest=manifest,
-            readme_content="",  # Will be uploaded separately
-            tags=tags if tags else None,
-            annotations=annotations if annotations else None,
-            config_path=Config.DTOOL_CONFIG_PATH
         )
+        proto_dataset.create()
+        proto_dataset.put_readme("")  # Empty README, will be uploaded
 
-        # Get storage broker from the created dataset to generate signed URLs
-        storage_broker = dataset._storage_broker
-        prefix = uuid + "/"
+        # Add tags to proto-dataset
+        if tags:
+            for tag in tags:
+                proto_dataset.put_tag(tag)
 
-        # Generate signed URLs only for README and items
+        # Add annotations to proto-dataset
+        if annotations:
+            for ann_name, ann_value in annotations.items():
+                proto_dataset.put_annotation(ann_name, ann_value)
+
+        # Store manifest and frozen_at for use when freezing
+        _pending_uploads[dataset_uuid] = {
+            'manifest': manifest,
+            'frozen_at': frozen_at,
+            'uri': proto_dataset.uri,
+        }
+
+        # Get storage broker from the created proto-dataset to generate signed URLs
+        storage_broker = proto_dataset._storage_broker
+
+        # Generate signed URLs for README and items
         upload_urls = {
             'readme': storage_broker.generate_signed_write_url(
                 storage_broker.get_readme_key(), expiry_seconds),
@@ -397,7 +425,7 @@ def get_upload_signed_urls(request_data, base_uri):
     ).isoformat()
 
     return {
-        'uuid': uuid,
+        'uuid': dataset_uuid,
         'uri': dataset_uri,
         'base_uri': base_uri,
         'expiry_seconds': expiry_seconds,
@@ -414,12 +442,15 @@ def signal_upload_complete(request_data):
     """Signal that a dataset upload is complete.
 
     After uploading all dataset components using the signed URLs from
-    the upload endpoint, call this endpoint to trigger dataset indexing
-    and registration in dserver.
+    the upload endpoint, call this endpoint to freeze the proto-dataset
+    and trigger dataset registration in dserver.
     """
     username = get_jwt_identity()
     uri = request_data['uri']
     base_uri = _extract_base_uri(uri)
+
+    # Extract UUID from URI
+    dataset_uuid = uri.rsplit("/", 1)[-1]
 
     # Authorization check
     if not may_register(username, base_uri):
@@ -429,15 +460,44 @@ def signal_upload_complete(request_data):
         )
         abort(403, description="No write access to this base URI")
 
-    # Load dataset using dtoolcore to validate it
+    # Check if we have pending upload data for this UUID
+    if dataset_uuid not in _pending_uploads:
+        logger.warning(f"No pending upload found for {uri}")
+        abort(400, description="No pending upload found for this dataset")
+
+    pending_data = _pending_uploads[dataset_uuid]
+    manifest = pending_data['manifest']
+    frozen_at = pending_data['frozen_at']
+
+    # Load proto-dataset and freeze it
+    try:
+        proto_dataset = dtoolcore.ProtoDataSet.from_uri(uri)
+    except dtoolcore.DtoolCoreTypeError as e:
+        # Already frozen? Try loading as DataSet
+        try:
+            dataset = dtoolcore.DataSet.from_uri(uri)
+            logger.info(f"Dataset {uri} already frozen, proceeding with registration")
+        except Exception as inner_e:
+            logger.warning(f"Upload complete but dataset invalid: {uri} - {e}")
+            abort(400, description=f"Invalid or incomplete dataset: {e}")
+    except Exception as e:
+        logger.error(f"Failed to load proto-dataset {uri}: {e}")
+        abort(400, description=f"Failed to load dataset: {e}")
+    else:
+        # Freeze the proto-dataset with the stored manifest
+        try:
+            proto_dataset.freeze_with_manifest(manifest, frozen_at=frozen_at)
+            logger.debug(f"Froze proto-dataset {uri}")
+        except Exception as e:
+            logger.error(f"Failed to freeze proto-dataset {uri}: {e}")
+            abort(500, description=f"Failed to freeze dataset: {e}")
+
+    # Load the frozen dataset
     try:
         dataset = dtoolcore.DataSet.from_uri(uri)
-    except dtoolcore.DtoolCoreTypeError as e:
-        logger.warning(f"Upload complete but dataset invalid: {uri} - {e}")
-        abort(400, description=f"Invalid or incomplete dataset: {e}")
     except Exception as e:
-        logger.error(f"Failed to load dataset {uri}: {e}")
-        abort(400, description=f"Failed to load dataset: {e}")
+        logger.error(f"Failed to load frozen dataset {uri}: {e}")
+        abort(500, description=f"Failed to load frozen dataset: {e}")
 
     # Generate dataset info for registration
     try:
@@ -452,6 +512,9 @@ def signal_upload_complete(request_data):
     except Exception as e:
         logger.error(f"Failed to register dataset {uri}: {e}")
         abort(500, description=f"Failed to register dataset: {e}")
+
+    # Clean up pending upload data
+    del _pending_uploads[dataset_uuid]
 
     logger.info(f"Successfully registered dataset from upload: {uri}")
 
