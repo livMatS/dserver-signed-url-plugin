@@ -48,6 +48,7 @@ class UploadRequestSchema(Schema):
     items = fields.List(fields.Nested(UploadItemSchema), metadata={"description": "List of items with full metadata"})
     tags = fields.List(fields.Str(), load_default=[], metadata={"description": "List of tags"})
     annotations = fields.Dict(keys=fields.Str(), values=fields.Raw(), load_default={}, metadata={"description": "Annotations as key-value pairs"})
+    overlays = fields.Dict(keys=fields.Str(), values=fields.Dict(keys=fields.Str(), values=fields.Raw()), load_default={}, metadata={"description": "Overlays as overlay name to item identifier/value mapping"})
 
 
 class UploadItemURLSchema(Schema):
