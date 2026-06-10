@@ -410,10 +410,19 @@ def get_upload_signed_urls(request_data, base_uri):
     name = request_data['name']
     creator_username = request_data['creator_username']
     frozen_at = request_data['frozen_at']
+    hash_function = request_data.get('hash_function', 'md5sum_hexdigest')
     items = request_data.get('items', [])
     tags = request_data.get('tags', [])
     annotations = request_data.get('annotations', {})
     overlays = request_data.get('overlays', {})
+
+    # Item hashes are pinned into the signed upload URLs as Content-MD5 and
+    # verified by the storage backend, which requires MD5 hashes
+    if hash_function != 'md5sum_hexdigest':
+        abort(400, description=(
+            f"Unsupported hash function '{hash_function}'; "
+            f"only 'md5sum_hexdigest' is supported"
+        ))
 
     # Generate dataset URI
     dataset_uri = f"{base_uri}/{dataset_uuid}"
@@ -448,7 +457,7 @@ def get_upload_signed_urls(request_data, base_uri):
 
         manifest = {
             "dtoolcore_version": dtoolcore.__version__,
-            "hash_function": "md5sum_hexdigest",
+            "hash_function": hash_function,
             "items": manifest_items,
         }
 
@@ -533,15 +542,25 @@ def get_upload_signed_urls(request_data, base_uri):
             'items': {}
         }
 
-        # Generate URLs for each item
+        # Generate URLs for each item. Where the storage broker supports it,
+        # the item's object metadata and Content-MD5 are pinned into the
+        # signature, so the storage backend itself rejects uploads whose
+        # content does not match the claimed hash.
         for item in items:
             relpath = item['relpath']
             identifier = dtoolcore.utils.generate_identifier(relpath)
-            item_key = storage_broker.data_key_prefix + identifier
+            if hasattr(storage_broker, 'generate_signed_item_write_url'):
+                url, headers = storage_broker.generate_signed_item_write_url(
+                    relpath, item['hash'], expiry_seconds)
+            else:
+                item_key = storage_broker.data_key_prefix + identifier
+                url = storage_broker.generate_signed_write_url(
+                    item_key, expiry_seconds)
+                headers = {}
             upload_urls['items'][identifier] = {
-                'url': storage_broker.generate_signed_write_url(
-                    item_key, expiry_seconds),
-                'relpath': relpath
+                'url': url,
+                'relpath': relpath,
+                'headers': headers,
             }
 
     except dtoolcore.DtoolCoreInvalidNameError as e:
