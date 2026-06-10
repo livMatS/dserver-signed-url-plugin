@@ -424,6 +424,13 @@ def get_upload_signed_urls(request_data, base_uri):
             f"only 'md5sum_hexdigest' is supported"
         ))
 
+    if not dtoolcore.utils.name_is_valid(name):
+        abort(400, description=(
+            f"Invalid dataset name '{name}'. Names may be up to 80 "
+            f"characters long and contain only alphanumeric characters "
+            f"and the special characters - _ ."
+        ))
+
     # Generate dataset URI
     dataset_uri = f"{base_uri}/{dataset_uuid}"
 
