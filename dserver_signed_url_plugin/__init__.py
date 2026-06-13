@@ -20,9 +20,12 @@ import click
 import dtoolcore
 import dtoolcore.utils
 
+from botocore.exceptions import ClientError
+
 from flask import abort, current_app, jsonify
 from flask.cli import AppGroup
 from flask_smorest import Blueprint
+from flask_smorest import abort as smorest_abort
 
 from dservercore import ExtensionABC, sql_db
 from dservercore.utils import (
@@ -576,6 +579,16 @@ def get_upload_signed_urls(request_data, base_uri):
     except dtoolcore.DtoolCoreValueError as e:
         logger.warning(f"Invalid value in upload request for {dataset_uri}: {e}")
         abort(400, description=str(e))
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        logger.error(
+            f"Storage backend rejected upload request for {dataset_uri}: {e}"
+        )
+        smorest_abort(502, message=(
+            f"The storage backend rejected the request ({error_code}). "
+            f"The server's storage credentials may lack write permission "
+            f"for this base URI. Please contact an administrator."
+        ))
     except Exception as e:
         logger.error(f"Failed to process upload request for {dataset_uri}: {e}")
         abort(500, description=f"Failed to process upload request: {e}")
@@ -663,6 +676,14 @@ def signal_upload_complete(request_data):
         try:
             proto_dataset.freeze_with_manifest(manifest, frozen_at=frozen_at)
             logger.debug(f"Froze proto-dataset {uri}")
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            logger.error(f"Storage backend rejected freeze of {uri}: {e}")
+            smorest_abort(502, message=(
+                f"The storage backend rejected the request ({error_code}). "
+                f"The server's storage credentials may lack write permission "
+                f"for this base URI. Please contact an administrator."
+            ))
         except Exception as e:
             logger.error(f"Failed to freeze proto-dataset {uri}: {e}")
             abort(500, description=f"Failed to freeze dataset: {e}")

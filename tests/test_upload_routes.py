@@ -4,6 +4,8 @@ from urllib.parse import quote
 
 import pytest
 
+from botocore.exceptions import ClientError
+
 import dtoolcore
 
 import dserver_signed_url_plugin as plugin
@@ -120,6 +122,22 @@ def test_upload_rejects_invalid_dataset_name(client, grumpy_token, upload_env):
     assert response.status_code == 400
 
 
+def test_upload_storage_access_denied_502(
+        client, grumpy_token, upload_env, monkeypatch):
+    def denied_generate_proto_dataset(admin_metadata, base_uri, **kw):
+        raise ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "Access Denied"}},
+            "PutObject")
+
+    monkeypatch.setattr(
+        dtoolcore, "generate_proto_dataset", denied_generate_proto_dataset)
+    response = client.post(
+        UPLOAD_ROUTE, json=upload_request_body(),
+        headers=auth_header(grumpy_token))
+    assert response.status_code == 502
+    assert b"AccessDenied" in response.data
+
+
 def test_upload_conflict_when_registered(client, grumpy_token, upload_env):
     upload_env["uri_exists"] = True
     response = client.post(
@@ -223,6 +241,24 @@ class TestUploadComplete:
             headers=auth_header(grumpy_token))
         assert response.status_code == 409
         # The foreign pending record must not be deleted.
+        assert PendingUpload.query.filter_by(uuid=UUID).count() == 1
+
+    def test_freeze_access_denied_502(self, client, grumpy_token,
+                                      complete_env):
+        def denied_freeze(manifest, frozen_at=None):
+            raise ClientError(
+                {"Error": {"Code": "AccessDenied",
+                           "Message": "Access Denied"}},
+                "PutObject")
+
+        complete_env["proto"].freeze_with_manifest = denied_freeze
+        self.add_pending()
+        response = client.post(
+            self.ROUTE, json={"uri": DATASET_URI},
+            headers=auth_header(grumpy_token))
+        assert response.status_code == 502
+        assert b"AccessDenied" in response.data
+        # Pending record must survive so the upload can be retried.
         assert PendingUpload.query.filter_by(uuid=UUID).count() == 1
 
     def test_success_freezes_registers_and_cleans_up(

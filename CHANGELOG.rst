@@ -7,6 +7,18 @@ The format is based on `Keep a Changelog <https://keepachangelog.com/en/1.0.0/>`
 and this project adheres to `Semantic Versioning <https://semver.org/spec/v2.0.0.html>`_.
 
 
+Unreleased
+----------
+
+Changed
+~~~~~~~
+
+- Upload initiation and upload completion now return ``502 Bad Gateway``
+  with an explanatory message when the storage backend rejects a
+  server-side write (e.g. ``AccessDenied`` because the server's storage
+  credentials lack write permission), instead of a generic ``500``
+
+
 v0.1.0 (2025-12-08)
 -------------------
 
